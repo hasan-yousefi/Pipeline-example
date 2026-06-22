@@ -1,0 +1,118 @@
+pipeline {
+    agent any
+    parameters {
+        string(name: 'DURATION', defaultValue: '30m', description: 'Duration of silence (30m, 1h) Max 1h')
+        string(name: 'DESCRIPTION', defaultValue: 'Manual Silence', description: 'Reason for this silence')
+        string(name: 'LABEL1', defaultValue: '', description: 'First Label (alertname="name") - REQUIRED')
+        string(name: 'LABEL2', defaultValue: '', description: 'Second Label (Optional)')
+        string(name: 'LABEL3', defaultValue: '', description: 'Third Label (Optional)')
+    }
+    environment {
+        ALERTMANAGER_URL = "http://example.com:9093/"
+        LDAP_SERVER = "ldap://example:<port>"
+        LDAP_BASE_DN = "dc=x,dc=y"
+        LDAP_BIND_DN = "CN=x,OU=y,OU=z,OU=x,OU=y,OU=z,DC=x,DC=y"
+    }
+    stages {
+        stage('Validate Parameters') {
+            steps {
+                script {
+                    if (!params.LABEL1 && !params.LABEL2 && !params.LABEL3) {
+                        error("Validation Error: You must provide at least one Label (LABEL1, LABEL2, or LABEL3).")
+                    }
+
+                    def match = params.DURATION =~ /^(\d+)([mh])$/
+                    if (!match) {
+                        error("Validation Error: Invalid duration format '${params.DURATION}'. Use format like '30m' or '1h'.")
+                    }
+
+                    def value = match[0][1].toInteger()
+                    def unit = match[0][2]
+                    def durationInMinutes = (unit == 'h') ? value * 60 : value
+
+                    def MAX_MINUTES = 360
+                    if (durationInMinutes > MAX_MINUTES) {
+                        error("Validation Error: Requested duration (${params.DURATION}) exceeds the maximum limit of 6 hour (1h or 60m).")
+                    }
+                }
+            }
+        }
+
+        stage('Get User and Set Team from AD') {
+            steps {
+                script {
+                    def buildCause = currentBuild.getBuildCauses()[0]
+                    def userId = buildCause.userId ?: "unknown"
+
+                    withCredentials([string(credentialsId: 'ldap-service-password', variable: 'LDAP_PASSWORD')]) {
+                        
+                        def getTeamCmd = 
+                            """
+                            ldapsearch -x -H ldap://example.com:<port> \\
+                                -D "CN=x,OU=y,OU=z,OU=x,OU=y,OU=z Main,DC=x,DC=y" \\
+                                -w "${LDAP_PASSWORD}" \\
+                                -b "DC=x,DC=y" \\
+                                "(sAMAccountName=${userId})" dn | \\
+                                grep "^dn: " | \\
+                                grep -o "OU=[^,]*" | \\
+                                head -n 2 | tail -n 1 | \\
+                                cut -d= -f2
+                            """
+                        def rawTeam = sh(script: getTeamCmd, returnStdout: true).trim()
+                        def finalTeam = ""
+
+                        if (rawTeam) {
+                            finalTeam = rawTeam.toLowerCase().replaceAll(/(teammember|team)$/, "")
+                        }
+
+                        if (!finalTeam) {
+                            error("Pipeline Terminated: No matching team/OU found in Active Directory for user [${env.USER_ID}].")
+                        }
+
+                        env.TEAM = finalTeam
+                        echo "User detected: ${userId} -> Assigned Team: ${env.TEAM}"
+                        env.FINAL_COMMENT = "${params.DESCRIPTION} (Created by ${userId})"
+                    }
+                }
+            }
+        }
+
+        stage('Run amtool') {
+            steps {
+                timeout(time: 10, unit: 'SECONDS'){
+                    script {
+                        sh """
+                          amtool silence add ${params.LABEL1} ${params.LABEL2} ${params.LABEL3} \
+                          team="${env.TEAM}" \
+                          --duration="${params.DURATION}" \
+                          --comment="${env.FINAL_COMMENT}" \
+                          --alertmanager.url="${env.ALERTMANAGER_URL}"
+                        """
+                    }
+                }
+            }
+        }
+        stage('Notify Mattermost') {
+            steps {
+                timeout(time: 3, unit: 'SECONDS'){
+                    script {
+                        withCredentials([string(credentialsId: 'MATTERMOST_WEBHOOK', variable: 'MATTERMOST_WEBHOOK')]) {
+                            def labelsUsed = [params.LABEL1, params.LABEL2, params.LABEL3].findAll { it != "" }.join(", ")
+                            def payload = 
+                            """{
+                                "text": "🔕 **Alert Silence Created**\\n\\n**User:** ${env.USER_ID}\\n**Team:** ${env.TEAM}\\n**Duration:** ${params.DURATION}\\n**Labels:** `${labelsUsed}`\\n**Reason:** ${params.DESCRIPTION}"
+                            }"""
+                        
+                            steps.sh """
+                                curl -i -X POST \
+                                -H 'Content-Type: application/json' \
+                                -d '${payload}' \
+                                ${env.MATTERMOST_WEBHOOK}
+                            """
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
